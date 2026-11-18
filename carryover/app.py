@@ -148,24 +148,24 @@ def create_app(database_path: str | None = None, testing: bool = False) -> Flask
     @app.get("/batches/<int:batch_id>")
     def batch_detail(batch_id: int):
         conn = get_db()
-        # inspect_results refuses to hand back "current" rows that do not match
-        # the accepted revisions; it invalidates them atomically if needed.
-        batch, results = store.inspect_results(conn, batch_id)
-        if batch is None:
+        # One SQLite snapshot supplies the batch state, verdicts, revision
+        # history and upload log, so a concurrent correction cannot make this
+        # response mix two accepted-data versions.  A forged "current" is
+        # repaired inside a write lock without clobbering a concurrent
+        # recompute that already committed consistent rows.
+        view = store.get_batch_view(conn, batch_id)
+        if view is None:
             return render_template("not_found.html"), 404
-        with db.snapshot(conn):
-            revisions = store.get_revisions(conn, batch_id)
-            uploads = store.get_upload_log(conn, batch_id)
         return render_template(
             "batch.html",
-            batch=batch,
-            results=results,
-            revisions=revisions,
-            uploads=uploads,
+            batch=view.batch,
+            results=view.results,
+            revisions=view.revisions,
+            uploads=view.uploads,
             state_labels=STATE_LABELS,
             status_labels=STATUS_LABELS,
             kind_labels=KIND_LABELS,
-            unavailable_reason=_unavailable_reason(batch, results),
+            unavailable_reason=_unavailable_reason(view.batch, view.results),
         )
 
     @app.post("/batches/<int:batch_id>/upload")
@@ -216,17 +216,20 @@ def create_app(database_path: str | None = None, testing: bool = False) -> Flask
     @app.get("/batches/<int:batch_id>/results.csv")
     def download_results(batch_id: int):
         conn = get_db()
-        batch, results = store.inspect_results(conn, batch_id)
-        if batch is None:
+        # Same single-snapshot guarantee as the batch page: a download opened
+        # after a correction is accepted can never serve the old verdict, and
+        # the rows always match the batch's accepted data version.
+        view = store.get_batch_view(conn, batch_id)
+        if view is None:
             return render_template("not_found.html"), 404
-        if results is None:
+        if view.results is None:
             flash("当前没有可信的现行结果，不能下载；请先完成重算。", "error")
             return redirect(url_for("batch_detail", batch_id=batch_id), code=303)
 
         buffer = io.StringIO()
         writer = csv.writer(buffer, lineterminator="\r\n")
         writer.writerow(["进样号", "类型", "峰面积", "修订号", "判定", "触发进样", "说明"])
-        for row in results:
+        for row in view.results:
             writer.writerow(
                 [
                     _csv_safe(row["injection_no"]),

@@ -34,6 +34,16 @@ class UploadSummary:
     changed: bool
 
 
+@dataclass(frozen=True)
+class BatchView:
+    """Everything one batch page (or download) renders, from one snapshot."""
+
+    batch: sqlite3.Row
+    results: Optional[list[sqlite3.Row]]
+    revisions: list[sqlite3.Row]
+    uploads: list[sqlite3.Row]
+
+
 def list_batches(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
         """
@@ -312,46 +322,51 @@ def mark_failed(conn: sqlite3.Connection, batch_id: int, message: str) -> None:
         )
 
 
-def inspect_results(
-    conn: sqlite3.Connection, batch_id: int
-) -> tuple[Optional[sqlite3.Row], Optional[list[sqlite3.Row]]]:
-    """Return (batch, current results or None), repairing a forged "current".
+def get_batch_view(
+    conn: sqlite3.Connection,
+    batch_id: int,
+    revision_limit: int = 200,
+    upload_limit: int = 30,
+) -> Optional[BatchView]:
+    """Return the full batch page payload from a single accepted-data snapshot.
 
-    Reads happen in a deferred (WAL snapshot) transaction so page views do not
-    serialize against each other.  Only when the snapshot looks inconsistent is
-    a write transaction taken, and the check is repeated there so a concurrent
-    recompute that already committed is never invalidated from stale data.
+    The batch row, current results, revision history and upload log are all
+    read inside one SQLite snapshot transaction, so a response can never mix
+    a verdict from one data version with revisions accepted by a concurrent
+    request.  Reads use a deferred (WAL snapshot) transaction and do not
+    serialize against each other.
+
+    A forged "current" (state says current, but the stored rows do not match
+    the accepted revisions) is repaired only after upgrading to a write
+    transaction and re-checking there; a concurrent recompute that committed a
+    consistent current result is therefore never invalidated from stale data.
     """
     with snapshot(conn):
         batch = get_batch(conn, batch_id)
         if batch is None:
-            return None, None
-        if (
-            batch["result_state"] != CURRENT
-            or batch["result_version"] is None
-            or batch["result_version"] != batch["data_version"]
-        ):
-            return batch, None
-        results = conn.execute(
-            "SELECT * FROM results WHERE batch_id = ? ORDER BY seq", (batch_id,)
-        ).fetchall()
-        if _snapshot_is_consistent(conn, batch, results):
-            return batch, results
+            return None
+        results = _current_results_if_consistent(conn, batch)
+        # All four payload parts come from this same snapshot.
+        view = BatchView(
+            batch=batch,
+            results=results,
+            revisions=get_revisions(conn, batch_id, revision_limit),
+            uploads=get_upload_log(conn, batch_id, upload_limit),
+        )
+        if results is not None or not _needs_repair(batch):
+            return view
 
+    # The snapshot claims "current" but its rows do not match the accepted
+    # revisions.  Upgrade to a write lock and repeat the check so a recompute
+    # another request finished meanwhile is not torn down by stale data.
     with immediate(conn):
         batch = get_batch(conn, batch_id)
         if batch is None:
-            return None, None
-        if (
-            batch["result_state"] != CURRENT
-            or batch["result_version"] is None
-            or batch["result_version"] != batch["data_version"]
-        ):
-            return batch, None
-        results = conn.execute(
-            "SELECT * FROM results WHERE batch_id = ? ORDER BY seq", (batch_id,)
-        ).fetchall()
-        if not _snapshot_is_consistent(conn, batch, results):
+            return None
+        results = _current_results_if_consistent(conn, batch)
+        revisions = get_revisions(conn, batch_id, revision_limit)
+        uploads = get_upload_log(conn, batch_id, upload_limit)
+        if results is None and _needs_repair(batch):
             conn.execute("DELETE FROM results WHERE batch_id = ?", (batch_id,))
             conn.execute(
                 """
@@ -362,8 +377,40 @@ def inspect_results(
                 """,
                 (STALE, "现行结果与已受理修订不一致，已作废", utcnow(), batch_id),
             )
-            return get_batch(conn, batch_id), None
-        return batch, results
+            batch = get_batch(conn, batch_id)
+        return BatchView(
+            batch=batch,
+            results=results,
+            revisions=revisions,
+            uploads=uploads,
+        )
+
+
+def _needs_repair(batch: sqlite3.Row) -> bool:
+    """True only when the batch claims a current result that may be forged."""
+    return (
+        batch["result_state"] == CURRENT
+        and batch["result_version"] is not None
+        and batch["result_version"] == batch["data_version"]
+    )
+
+
+def _current_results_if_consistent(
+    conn: sqlite3.Connection, batch: sqlite3.Row
+) -> Optional[list[sqlite3.Row]]:
+    """Return current rows from the active snapshot when they are trustworthy.
+
+    Returns None (without writing) when the batch has no usable current result
+    yet, or when a stamped-current result does not match accepted revisions.
+    """
+    if not _needs_repair(batch):
+        return None
+    results = conn.execute(
+        "SELECT * FROM results WHERE batch_id = ? ORDER BY seq", (batch["id"],)
+    ).fetchall()
+    if not _snapshot_is_consistent(conn, batch, results):
+        return None
+    return results
 
 
 def _snapshot_is_consistent(

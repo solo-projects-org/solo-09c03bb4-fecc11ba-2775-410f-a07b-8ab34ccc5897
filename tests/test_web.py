@@ -395,6 +395,103 @@ def test_empty_upload_and_missing_file_are_reported(client):
     assert "CSV 文件为空" in page(client)
 
 
+def test_page_reads_one_snapshot_while_correction_is_accepted(
+    client, app, monkeypatch
+):
+    """A page response must not mix an old current verdict with new revisions.
+
+    The page request is paused inside its read snapshot; another request then
+    accepts a higher-revision blank correction.  When the page resumes it must
+    still render the complete old snapshot (old verdict, old revision history),
+    while every page or download opened after the commit shows only the new
+    data -- never a mixture of the two.
+    """
+    create(client)
+    entered = threading.Event()
+    release = threading.Event()
+    original = store.get_revisions
+
+    def blocked_revisions(conn, batch_id, limit=200):
+        entered.set()
+        release.wait(timeout=10)
+        return original(conn, batch_id, limit)
+
+    monkeypatch.setattr(store, "get_revisions", blocked_revisions)
+
+    captured = {}
+
+    def open_page():
+        captured["text"] = client.get("/batches/1").get_data(as_text=True)
+
+    page_thread = threading.Thread(target=open_page)
+    page_thread.start()
+    assert entered.wait(timeout=10)
+
+    # The page holds a read snapshot; the correction commits while it is paused.
+    response = app.test_client().post(
+        "/batches/1/upload",
+        data={
+            "csv_file": (
+                __import__("io").BytesIO(csv_bytes("B1,blank,500,2")),
+                "fix.csv",
+            )
+        },
+        content_type="multipart/form-data",
+    )
+    assert response.status_code == 303
+    release.set()
+    page_thread.join(timeout=10)
+    assert not page_thread.is_alive()
+
+    # In-flight response: one coherent pre-accept snapshot.  No piece of the
+    # correction (revision row, new area, new verdict) may leak into it.
+    old_text = captured["text"]
+    old_revisions = old_text.split("<h2>已受理修订</h2>")[1].split("</section>")[0]
+    assert old_revisions.count("<td>B1</td>") == 1
+    assert "500" not in old_text
+    assert status_of(old_text, "B1") == "空白未超限"
+
+    monkeypatch.undo()
+
+    # Every freshly opened page after the commit shows only the new snapshot.
+    new_text = page(client)
+    new_revisions = new_text.split("<h2>已受理修订</h2>")[1].split("</section>")[0]
+    assert new_revisions.count("<td>B1</td>") == 2
+    assert status_of(new_text, "B1") == "空白超限"
+    assert status_of(new_text, "S3") == "残留风险"
+
+    # A download opened later cannot serve the old verdict either.
+    download = client.get("/batches/1/results.csv").get_data(as_text=True)
+    assert "B1,冲洗空白,500,2,空白超限" in download
+    assert "B1,冲洗空白,10,1" not in download
+
+
+def test_failed_recompute_keeps_a_current_result_committed_concurrently(
+    client, app
+):
+    """mark_failed must not undo another request's finished current recompute."""
+    create(client)
+    conn = db.connect(app.config["DATABASE"])
+    try:
+        # A second request has already produced a current result for data
+        # version 1.
+        assert store.get_batch(conn, 1)["result_state"] == "current"
+
+        # The loser of a recompute race fails afterwards; its failure record
+        # must be a no-op against the winner's consistent current rows.
+        store.mark_failed(conn, 1, "重算失败：模拟并发竞争失败")
+
+        batch = store.get_batch(conn, 1)
+        assert batch["result_state"] == "current"
+        assert batch["result_version"] == batch["data_version"]
+        assert batch["result_error"] is None
+        view = store.get_batch_view(conn, 1)
+        assert view is not None and view.results is not None
+        assert len(view.results) == 4
+    finally:
+        conn.close()
+
+
 def test_thresholds_must_be_finite_and_non_negative(client):
     create(client)
     for high, blank in [("-1", "50"), ("nan", "50"), ("1000", "-5"), ("", "50")]:
