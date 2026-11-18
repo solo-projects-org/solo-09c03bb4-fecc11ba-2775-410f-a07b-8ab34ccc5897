@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}批次列表 · 残留风险复核{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>新建批次</h1>
+  <p class="hint">首次上传时设定本批高值阈值与空白上限；CSV 每行包含进样号、类型、峰面积、修订号。</p>
+  <form method="post" action="{{ url_for('create_batch_route') }}" enctype="multipart/form-data" class="stack">
+    <label>批次名称
+      <input type="text" name="name" maxlength="100" required value="{{ form.name if form else '' }}" placeholder="例如：2026-11-18 批次 A">
+    </label>
+    <div class="grid2">
+      <label>高值阈值（样品峰面积 ≥ 此值为高值）
+        <input type="number" name="high_threshold" step="any" min="0" required value="{{ form.high_threshold if form else '' }}">
+      </label>
+      <label>空白上限（冲洗空白峰面积 ≤ 此值才能解除风险）
+        <input type="number" name="blank_limit" step="any" min="0" required value="{{ form.blank_limit if form else '' }}">
+      </label>
+    </div>
+    <label>批次 CSV
+      <input type="file" name="csv_file" accept=".csv,text/csv" required>
+    </label>
+    <button type="submit">上传并计算</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>已有批次</h2>
+  {% if batches %}
+  <table>
+    <thead>
+      <tr><th>批次</th><th>高值阈值</th><th>空白上限</th><th>进样数</th><th>状态</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for batch in batches %}
+      <tr>
+        <td>{{ batch.name }}</td>
+        <td>{{ '%g'|format(batch.high_threshold) }}</td>
+        <td>{{ '%g'|format(batch.blank_limit) }}</td>
+        <td>{{ batch.injection_count }}</td>
+        <td>
+          {% if batch.result_state == 'current' %}
+            <span class="badge ok">现行结果</span>
+          {% elif batch.result_state == 'pending' %}
+            <span class="badge warn">待重算</span>
+          {% else %}
+            <span class="badge bad">结果已作废</span>
+          {% endif %}
+        </td>
+        <td><a href="{{ url_for('batch_detail', batch_id=batch.id) }}">查看</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="hint">还没有批次。</p>
+  {% endif %}
+</section>
+{% endblock %}

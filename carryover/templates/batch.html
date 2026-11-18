@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% block title %}{{ batch.name }} · 残留风险复核{% endblock %}
+{% block content %}
+<section class="card">
+  <div class="row-between">
+    <div>
+      <h1>{{ batch.name }}</h1>
+      <p class="hint">
+        高值阈值 {{ '%g'|format(batch.high_threshold) }} ·
+        空白上限 {{ '%g'|format(batch.blank_limit) }} ·
+        数据版本 {{ batch.data_version }}
+      </p>
+    </div>
+    <div class="actions">
+      <form method="post" action="{{ url_for('recompute_route', batch_id=batch.id) }}">
+        <button type="submit" class="secondary">重新计算</button>
+      </form>
+      {% if results is not none %}
+        <a class="button" href="{{ url_for('download_results', batch_id=batch.id) }}">下载现行结果 CSV</a>
+      {% else %}
+        <span class="button disabled" aria-disabled="true">下载现行结果 CSV</span>
+      {% endif %}
+    </div>
+  </div>
+
+  <p class="state">
+    计算结果状态：
+    {% if results is not none %}
+      <span class="badge ok">现行结果（数据版本 {{ batch.result_version }}）</span>
+      <span class="hint">计算于 {{ batch.computed_at }}</span>
+    {% else %}
+      <span class="badge {{ 'warn' if batch.result_state == 'pending' else 'bad' }}">
+        {{ state_labels.get(batch.result_state, batch.result_state) }}
+      </span>
+      <span class="hint">{{ unavailable_reason }}</span>
+    {% endif %}
+  </p>
+</section>
+
+<section class="card">
+  <h2>上传更正</h2>
+  <p class="hint">
+    同一进样号只接受比现有修订号更高的修订；被接受的更正会立即作废旧结果，再整批重算。
+    更正中首次出现的进样号按文件顺序追加到批次末尾。
+  </p>
+  <form method="post" action="{{ url_for('upload_correction', batch_id=batch.id) }}" enctype="multipart/form-data" class="inline">
+    <input type="file" name="csv_file" accept=".csv,text/csv" required>
+    <button type="submit">上传更正</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>整批现行结果</h2>
+  {% if results is not none %}
+  <table>
+    <thead>
+      <tr><th>进样号</th><th>类型</th><th>峰面积</th><th>修订</th><th>判定</th><th>触发进样</th><th>说明</th></tr>
+    </thead>
+    <tbody>
+      {% for row in results %}
+      <tr class="status-{{ row.status }}">
+        <td>{{ row.injection_no }}</td>
+        <td>{{ kind_labels.get(row.kind, row.kind) }}</td>
+        <td>{{ '' if row.peak_area is none else '%g'|format(row.peak_area) }}</td>
+        <td>{{ row.revision }}</td>
+        <td><span class="badge status">{{ status_labels.get(row.status, row.status) }}</span></td>
+        <td>{{ row.trigger_injection or '' }}</td>
+        <td class="note">{{ row.note }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">暂无可展示的现行结果。{{ unavailable_reason }}</p>
+  {% endif %}
+</section>
+
+<section class="card two-col">
+  <div>
+    <h2>已受理修订</h2>
+    {% if revisions %}
+    <table class="compact">
+      <thead><tr><th>进样号</th><th>类型</th><th>峰面积</th><th>修订</th><th>受理时间</th></tr></thead>
+      <tbody>
+        {% for row in revisions %}
+        <tr>
+          <td>{{ row.injection_no }}</td>
+          <td>{{ kind_labels.get(row.kind, row.kind) }}</td>
+          <td>{{ '' if row.peak_area is none else '%g'|format(row.peak_area) }}</td>
+          <td>{{ row.revision }}</td>
+          <td class="mono">{{ row.accepted_at }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="hint">暂无记录。</p>
+    {% endif %}
+  </div>
+  <div>
+    <h2>上传记录</h2>
+    {% if uploads %}
+    <table class="compact">
+      <thead><tr><th>文件</th><th>受理</th><th>跳过</th><th>时间</th></tr></thead>
+      <tbody>
+        {% for row in uploads %}
+        <tr>
+          <td>{{ row.filename }}</td>
+          <td>{{ row.accepted_count }}</td>
+          <td>{{ row.skipped_count }}</td>
+          <td class="mono">{{ row.created_at }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="hint">暂无记录。</p>
+    {% endif %}
+  </div>
+</section>
+{% endblock %}

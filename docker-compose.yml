@@ -1,0 +1,15 @@
+services:
+  web:
+    build: .
+    image: carryover-review:local
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_PATH: /data/carryover.sqlite3
+      SECRET_KEY: ${SECRET_KEY:-please-change-this-local-key}
+    volumes:
+      - carryover-data:/data
+    restart: unless-stopped
+
+volumes:
+  carryover-data:
